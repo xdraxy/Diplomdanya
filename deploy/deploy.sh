@@ -106,10 +106,15 @@ apt-get update -qq
 apt-get install -yqq \
     curl wget gnupg ca-certificates lsb-release \
     git build-essential ufw \
-    python3.11 python3.11-venv python3.11-dev \
+    python3 python3-venv python3-dev python3-pip \
     nginx >/dev/null
 
-ok "Базовые пакеты установлены"
+# Определяем доступный python (3.12 на Ubuntu 24.04, 3.10 на 22.04 и т.д.)
+PYTHON_BIN="$(command -v python3)"
+[[ -x "$PYTHON_BIN" ]] || fail "python3 не найден после установки"
+PY_VER="$($PYTHON_BIN -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+
+ok "Базовые пакеты установлены (Python $PY_VER)"
 
 # ============================================================================
 # Шаг 2: Node.js 20 + Yarn
@@ -134,10 +139,21 @@ if ! systemctl list-unit-files | grep -q mongod.service; then
     curl -fsSL https://pgp.mongodb.com/server-7.0.asc | \
         gpg -o /usr/share/keyrings/mongodb-7.0.gpg --dearmor --yes
     UBUNTU_CODENAME="$(lsb_release -cs)"
-    # MongoDB официально поддерживает jammy (22.04). Для других — используем jammy.
+    # MongoDB 7 официально поддерживает focal (20.04) и jammy (22.04).
+    # Для noble (24.04) и других используем jammy-репозиторий — пакеты совместимы.
     case "$UBUNTU_CODENAME" in
-        jammy|focal|noble) MONGO_REPO="$UBUNTU_CODENAME" ;;
-        *) MONGO_REPO="jammy" ;;
+        jammy|focal) MONGO_REPO="$UBUNTU_CODENAME" ;;
+        *)
+            warn "MongoDB 7 не имеет официального репо для '$UBUNTU_CODENAME' — используем jammy"
+            MONGO_REPO="jammy"
+            # На Ubuntu 24.04 mongod может требовать libssl1.1, который удалён из noble
+            if [[ "$UBUNTU_CODENAME" == "noble" ]] && ! dpkg -l | grep -q libssl1.1; then
+                info "Установка libssl1.1 (нужна для mongod на Ubuntu 24.04)..."
+                wget -q http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb -O /tmp/libssl1.1.deb
+                dpkg -i /tmp/libssl1.1.deb >/dev/null 2>&1 || apt-get install -fyqq >/dev/null
+                rm -f /tmp/libssl1.1.deb
+            fi
+            ;;
     esac
     echo "deb [signed-by=/usr/share/keyrings/mongodb-7.0.gpg] https://repo.mongodb.org/apt/ubuntu $MONGO_REPO/mongodb-org/7.0 multiverse" \
         > /etc/apt/sources.list.d/mongodb-org-7.0.list
@@ -184,7 +200,7 @@ ok "Код развёрнут в $APP_DIR"
 # Шаг 6: Backend — venv + зависимости + .env
 # ============================================================================
 info "Установка Python-зависимостей..."
-sudo -u "$APP_USER" python3.11 -m venv "$APP_DIR/backend/venv"
+sudo -u "$APP_USER" "$PYTHON_BIN" -m venv "$APP_DIR/backend/venv"
 sudo -u "$APP_USER" "$APP_DIR/backend/venv/bin/pip" install -q --upgrade pip
 sudo -u "$APP_USER" "$APP_DIR/backend/venv/bin/pip" install -q -r "$APP_DIR/backend/requirements.txt"
 
