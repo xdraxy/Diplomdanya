@@ -1,34 +1,128 @@
-.App-logo {
-    height: 40vmin;
-    pointer-events: none;
+.App {
+  font-family:
+    system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
 }
 
-@media (prefers-reduced-motion: no-preference) {
-    .App-logo {
-        animation: App-logo-spin infinite 20s linear;
-    }
+.mono {
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New",
+    monospace;
 }
 
-.App-header {
-    background-color: #0f0f10;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    font-size: calc(10px + 2vmin);
-    color: white;
+/* Глобальная подложка с тонким радиальным свечением */
+.app-bg {
+  background-color: #09090b;
+  background-image:
+    radial-gradient(
+      circle at 20% -10%,
+      rgba(6, 182, 212, 0.12),
+      transparent 50%
+    ),
+    radial-gradient(
+      circle at 80% 110%,
+      rgba(59, 130, 246, 0.08),
+      transparent 50%
+    );
+  min-height: 100vh;
 }
 
-.App-link {
-    color: #61dafb;
+/* Анимация пульса синхронизации */
+@keyframes sync-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(1.4);
+  }
+}
+.sync-dot {
+  animation: sync-pulse 2s ease-in-out infinite;
 }
 
-@keyframes App-logo-spin {
-    from {
-        transform: rotate(0deg);
-    }
-    to {
-        transform: rotate(360deg);
-    }
+/* Кастомный скроллбар (тёмный, тонкий) */
+.thin-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.thin-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.thin-scroll::-webkit-scrollbar-thumb {
+  background: rgba(113, 113, 122, 0.5);
+  border-radius: 3px;
+}
+.thin-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(161, 161, 170, 0.7);
+}
+
+/* Эквалайзер при воспроизведении */
+.eq-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 14px;
+}
+.eq-bars span {
+  width: 3px;
+  background: #22d3ee;
+  border-radius: 2px;
+  animation: eq 1s ease-in-out infinite;
+}
+.eq-bars span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.eq-bars span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+.eq-bars span:nth-child(4) {
+  animation-delay: 0.1s;
+}
+@keyframes eq {
+  0%,
+  100% {
+    height: 30%;
+  }
+  50% {
+    height: 100%;
+  }
+}
+
+/* Сетка для меток в фоне (декор) */
+.grid-bg {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+/* Прячем нативный input file */
+.hidden-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Анимация появления */
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.fade-up {
+  animation: fade-up 0.4s ease-out both;
 }
