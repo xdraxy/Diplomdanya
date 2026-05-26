@@ -101,7 +101,7 @@ export default function AudioPlayer({
         <div className="w-full max-w-2xl mt-8">
           <Slider
             data-testid="seek-slider"
-            disabled={!track || !audioReady}
+            disabled={!track}
             value={seekValue}
             max={duration || 1}
             step={0.1}

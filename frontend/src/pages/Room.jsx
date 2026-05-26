@@ -51,6 +51,11 @@ export default function Room() {
 
   const audioRef = useRef(null);
   const fileInputRef = useRef(null);
+  // Хранит URL, который мы реально загружали в <audio>. Сравниваем с ним,
+  // а не с audio.src — браузер нормализует/меняет audio.src, из-за чего
+  // следующий applyState может ошибочно посчитать URL изменившимся и
+  // перезагрузить трек (сброс currentTime → 0).
+  const loadedSrcRef = useRef(null);
   const stateMetaRef = useRef({
     serverPos: 0,
     serverPlaying: false,
@@ -118,12 +123,16 @@ export default function Room() {
       if (!audio) return;
       if (state.track && state.track.url) {
         const newUrl = `${BACKEND_URL}${state.track.url}`;
-        if (audio.src !== newUrl) {
+        // Перезагружаем audio только если URL РЕАЛЬНО другой
+        // (сравнение через loadedSrcRef, а не audio.src).
+        if (loadedSrcRef.current !== newUrl) {
+          loadedSrcRef.current = newUrl;
           audio.src = newUrl;
           audio.load();
           setAudioReady(false);
         }
       } else {
+        loadedSrcRef.current = null;
         audio.removeAttribute("src");
         audio.load();
       }
@@ -213,6 +222,8 @@ export default function Room() {
   }, [send]);
 
   // ---- handlers ----
+  // Оптимистично обновляем stateMetaRef, чтобы следующий 200-мс тик не
+  // «откатывал» локальные изменения до прихода ответа от сервера.
   const togglePlay = useCallback(() => {
     if (!roomState.track) {
       toast.error("Сначала загрузите трек");
@@ -227,11 +238,31 @@ export default function Room() {
       }
       setNeedsUserGesture(false);
     }
+    const audio = audioRef.current;
     if (roomState.playing) {
+      const pos = audio ? audio.currentTime : stateMetaRef.current.serverPos;
+      stateMetaRef.current = {
+        serverPos: pos,
+        serverPlaying: false,
+        receivedAt: performance.now() / 1000,
+      };
+      if (audio && !audio.paused) audio.pause();
+      setRoomState((s) => ({ ...s, playing: false, position: pos }));
       send({ type: "pause" });
     } else {
-      const audio = audioRef.current;
       const pos = audio ? audio.currentTime : 0;
+      stateMetaRef.current = {
+        serverPos: pos,
+        serverPlaying: true,
+        receivedAt: performance.now() / 1000,
+      };
+      if (audio && audio.paused) {
+        audio.play().catch((err) => {
+          console.warn("Room: play blocked", err);
+          setNeedsUserGesture(true);
+        });
+      }
+      setRoomState((s) => ({ ...s, playing: true, position: pos }));
       send({ type: "play", position: pos });
     }
   }, [roomState.track, roomState.playing, needsUserGesture, send]);
@@ -247,19 +278,32 @@ export default function Room() {
     (v) => {
       seekDraggingRef.current = false;
       if (!roomState.track) return;
-      // Локально сразу переводим audio, чтобы перемотка ощущалась мгновенно;
-      // авторитетное значение придёт обратно от сервера событием `state`.
+      const target = v[0];
+      // КРИТИЧНО: оптимистично обновляем stateMetaRef ПЕРЕД отправкой seek
+      // на сервер. Иначе ближайший 200-мс тик сравнит audio.currentTime
+      // (новое значение) с target, посчитанным по СТАРОМУ play_started_at,
+      // увидит drift > 0.2с и откатит перемотку.
+      stateMetaRef.current = {
+        serverPos: target,
+        serverPlaying: !!roomState.playing,
+        receivedAt: performance.now() / 1000,
+      };
+      // Локальный seek для мгновенного отклика
       const audio = audioRef.current;
-      if (audio && isFinite(audio.duration)) {
+      if (audio) {
         try {
-          audio.currentTime = Math.max(0, Math.min(v[0], audio.duration));
+          const max = isFinite(audio.duration)
+            ? audio.duration
+            : roomState.track.duration || target;
+          audio.currentTime = Math.max(0, Math.min(target, max));
         } catch (err) {
           console.warn("Room: local seek failed", err);
         }
       }
-      send({ type: "seek", position: v[0] });
+      setLocalTime(target);
+      send({ type: "seek", position: target });
     },
-    [roomState.track, send]
+    [roomState.track, roomState.playing, send]
   );
 
   const handleVolume = useCallback(
@@ -349,7 +393,18 @@ export default function Room() {
     [syncWithServer]
   );
 
-  const handleAudioEnded = useCallback(() => send({ type: "pause" }), [send]);
+  // При окончании трека: оптимистично обновляем локальное состояние, чтобы
+  // тик не пытался снова запустить воспроизведение до ответа сервера.
+  const handleAudioEnded = useCallback(() => {
+    const dur = audioRef.current?.duration || 0;
+    stateMetaRef.current = {
+      serverPos: dur,
+      serverPlaying: false,
+      receivedAt: performance.now() / 1000,
+    };
+    setRoomState((s) => ({ ...s, playing: false, position: dur }));
+    send({ type: "pause" });
+  }, [send]);
 
   return (
     <div className="app-bg grid-bg min-h-screen flex flex-col" data-testid="room-page">

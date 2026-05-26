@@ -147,6 +147,87 @@ class TestFileServe:
         assert r.status_code == 404
 
 
+class TestRangeRequests:
+    """Iteration 4: HTTP Range support is critical for <audio> seek."""
+
+    @pytest.fixture
+    def uploaded_url(self, api_client, base_url, created_room):
+        files = {"file": ("range.mp3", _make_dummy_mp3(8192), "audio/mpeg")}
+        r = api_client.post(
+            f"{base_url}/api/rooms/{created_room}/upload",
+            data={"name": "Range"},
+            files=files,
+        )
+        assert r.status_code == 200, r.text
+        return r.json()["track"]["url"]
+
+    def test_no_range_returns_200_with_accept_ranges(self, api_client, base_url, uploaded_url):
+        r = api_client.get(f"{base_url}{uploaded_url}")
+        assert r.status_code == 200
+        assert r.headers.get("accept-ranges", "").lower() == "bytes"
+        assert "audio" in r.headers.get("content-type", "")
+        # Full file content returned
+        assert len(r.content) > 0
+
+    def test_range_bytes_0_99_returns_206(self, api_client, base_url, uploaded_url):
+        r = api_client.get(
+            f"{base_url}{uploaded_url}",
+            headers={"Range": "bytes=0-99"},
+        )
+        assert r.status_code == 206, f"Expected 206 Partial Content, got {r.status_code}"
+        assert r.headers.get("content-length") == "100"
+        cr = r.headers.get("content-range", "")
+        assert cr.startswith("bytes 0-99/"), f"bad Content-Range: {cr}"
+        assert r.headers.get("accept-ranges", "").lower() == "bytes"
+        assert len(r.content) == 100
+
+    def test_range_bytes_200_499_returns_206_300_bytes(self, api_client, base_url, uploaded_url):
+        r = api_client.get(
+            f"{base_url}{uploaded_url}",
+            headers={"Range": "bytes=200-499"},
+        )
+        assert r.status_code == 206
+        assert r.headers.get("content-length") == "300"
+        cr = r.headers.get("content-range", "")
+        assert cr.startswith("bytes 200-499/")
+        assert len(r.content) == 300
+
+    def test_range_open_ended_uses_file_size_minus_1(self, api_client, base_url, uploaded_url):
+        # First find file size
+        head = api_client.get(f"{base_url}{uploaded_url}")
+        total = len(head.content)
+        # Request bytes=N- (no end)
+        start = total - 50
+        r = api_client.get(
+            f"{base_url}{uploaded_url}",
+            headers={"Range": f"bytes={start}-"},
+        )
+        assert r.status_code == 206
+        assert r.headers.get("content-length") == "50"
+        cr = r.headers.get("content-range", "")
+        assert cr == f"bytes {start}-{total - 1}/{total}"
+        assert len(r.content) == 50
+
+    def test_malformed_range_returns_416(self, api_client, base_url, uploaded_url):
+        head = api_client.get(f"{base_url}{uploaded_url}")
+        total = len(head.content)
+        # Range beyond EOF
+        r = api_client.get(
+            f"{base_url}{uploaded_url}",
+            headers={"Range": f"bytes={total + 100}-{total + 200}"},
+        )
+        assert r.status_code == 416
+        cr = r.headers.get("content-range", "")
+        assert cr == f"bytes */{total}"
+
+    def test_invalid_range_unit_returns_416(self, api_client, base_url, uploaded_url):
+        r = api_client.get(
+            f"{base_url}{uploaded_url}",
+            headers={"Range": "items=0-10"},
+        )
+        assert r.status_code == 416
+
+
 # ============ WebSocket tests ============
 
 @pytest.mark.asyncio

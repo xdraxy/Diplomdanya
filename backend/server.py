@@ -20,11 +20,12 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from mutagen.id3 import ID3, ID3NoHeaderError
 from mutagen.mp3 import MP3
@@ -356,18 +357,74 @@ async def upload_track(
 
 
 @api_router.get("/files/{filename}")
-async def serve_file(filename: str):
+async def serve_file(filename: str, request: Request):
+    """
+    Раздача статики с поддержкой HTTP Range — критически важно для
+    корректной перемотки в <audio>. Без 206 Partial Content браузер
+    не может корректно сикать по треку.
+    """
     if "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Недопустимое имя файла")
     file_path = UPLOAD_DIR / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Файл не найден")
+
     media = "audio/mpeg"
     if filename.endswith(".jpg") or filename.endswith(".jpeg"):
         media = "image/jpeg"
     elif filename.endswith(".png"):
         media = "image/png"
-    return FileResponse(str(file_path), media_type=media)
+
+    file_size = file_path.stat().st_size
+    range_header = request.headers.get("range")
+
+    if not range_header:
+        return FileResponse(
+            str(file_path),
+            media_type=media,
+            headers={"Accept-Ranges": "bytes"},
+        )
+
+    # Парсим "bytes=start-end" (end опционален)
+    try:
+        units, _, rng = range_header.partition("=")
+        if units.strip().lower() != "bytes":
+            raise ValueError("invalid unit")
+        start_s, _, end_s = rng.strip().partition("-")
+        start = int(start_s) if start_s else 0
+        end = int(end_s) if end_s else file_size - 1
+        if start < 0 or end < start or end >= file_size:
+            raise ValueError("invalid range")
+    except ValueError:
+        return Response(
+            status_code=416,
+            headers={"Content-Range": f"bytes */{file_size}"},
+        )
+
+    length = end - start + 1
+
+    def stream():
+        chunk_size = 64 * 1024
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                data = f.read(min(chunk_size, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+
+    return StreamingResponse(
+        stream(),
+        status_code=206,
+        media_type=media,
+        headers={
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Content-Length": str(length),
+            "Accept-Ranges": "bytes",
+        },
+    )
 
 
 # =========================================================================
