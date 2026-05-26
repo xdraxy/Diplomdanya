@@ -342,11 +342,14 @@ async def upload_track(
     meta = extract_metadata(file_path, fallback_title)
     track = _build_track_dict(file_path, filename, name, meta)
 
+    # Согласно спецификации: при загрузке нового трека сервер фиксирует
+    # current_time = 0 и is_playing = false. Пользователь должен явно
+    # нажать Play, чтобы запустить трек у всех.
     room.track = track
     room.last_uploader = name
     room.position = 0.0
-    room.play_started_at = time.time()
-    room.playing = True
+    room.play_started_at = None
+    room.playing = False
 
     await broadcast(code, {"type": "track_change", "state": room.state_dict()})
     return {"ok": True, "track": room.state_dict()["track"]}

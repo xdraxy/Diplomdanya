@@ -125,7 +125,10 @@ class TestUpload:
         assert rs["track"] is not None
         assert rs["track"]["filename"] == "song.mp3"
         assert rs["last_uploader"] == "Тестер"
-        assert rs["playing"] is True  # backend starts playback on upload
+        # Per spec (iteration 3): upload does NOT auto-play. Server fixes
+        # position=0, playing=False, play_started_at=None. User must press Play.
+        assert rs["playing"] is False
+        assert rs["position"] == 0
 
         # Serve the file
         fr = api_client.get(f"{base_url}{tr['url']}")
@@ -227,6 +230,73 @@ async def test_ws_two_clients_sync_chat_volume(base_url, api_client):
         await a.send(json.dumps({"type": "ping"}))
         m = await wait_for_type(a, "pong")
         assert "server_time" in m
+
+
+@pytest.mark.asyncio
+async def test_ws_upload_does_not_autoplay_and_play_propagates(base_url, api_client):
+    """Iteration 3 spec: upload must NOT auto-play. Pressing play flips state
+    for all connected clients."""
+    code = api_client.post(f"{base_url}/api/rooms").json()["code"]
+
+    async with websockets.connect(_ws_url(base_url, code)) as a, \
+            websockets.connect(_ws_url(base_url, code)) as b:
+        await a.send(json.dumps({"type": "join", "name": "Алиса"}))
+        await asyncio.wait_for(a.recv(), timeout=5)  # init
+        await b.send(json.dumps({"type": "join", "name": "Боб"}))
+        await asyncio.wait_for(b.recv(), timeout=5)  # init
+        # drain participants notifications
+        async def drain(sock, t=0.3):
+            try:
+                while True:
+                    await asyncio.wait_for(sock.recv(), timeout=t)
+            except asyncio.TimeoutError:
+                pass
+        await drain(a)
+        await drain(b)
+
+        # Upload — both clients should receive track_change with playing=False
+        files = {"file": ("song.mp3", _make_dummy_mp3(), "audio/mpeg")}
+        r = api_client.post(
+            f"{base_url}/api/rooms/{code}/upload",
+            data={"name": "Алиса"}, files=files,
+        )
+        assert r.status_code == 200
+
+        async def wait_type(sock, t):
+            for _ in range(10):
+                m = json.loads(await asyncio.wait_for(sock.recv(), timeout=5))
+                if m.get("type") == t:
+                    return m
+            raise AssertionError(f"no {t}")
+
+        tc_a = await wait_type(a, "track_change")
+        tc_b = await wait_type(b, "track_change")
+        assert tc_a["state"]["playing"] is False
+        assert tc_a["state"]["position"] == 0
+        assert tc_b["state"]["playing"] is False
+        assert tc_b["state"]["track"] is not None
+
+        # REST GET also confirms state
+        rs = api_client.get(f"{base_url}/api/rooms/{code}").json()
+        assert rs["playing"] is False
+        assert rs["position"] == 0
+
+        # A presses play — B should receive state with playing=True
+        await a.send(json.dumps({"type": "play", "position": 0}))
+        st_b = await wait_type(b, "state")
+        assert st_b["state"]["playing"] is True
+
+        # A pauses — both flip to playing=False; position preserved >=0
+        await asyncio.sleep(0.3)
+        await a.send(json.dumps({"type": "pause"}))
+        st_b = await wait_type(b, "state")
+        assert st_b["state"]["playing"] is False
+        assert st_b["state"]["position"] >= 0
+
+        # A seeks to 7 while paused — position must equal 7
+        await a.send(json.dumps({"type": "seek", "position": 7.0}))
+        st_b = await wait_type(b, "state")
+        assert abs(st_b["state"]["position"] - 7.0) < 0.01
 
 
 @pytest.mark.asyncio

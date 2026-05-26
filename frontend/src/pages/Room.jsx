@@ -44,6 +44,10 @@ export default function Room() {
   const [audioReady, setAudioReady] = useState(false);
   const [needsUserGesture, setNeedsUserGesture] = useState(false);
   const [localTime, setLocalTime] = useState(0);
+  // Когда пользователь тащит ползунок перемотки, локальный «тик» не должен
+  // перезаписывать localTime значением audio.currentTime — иначе ползунок
+  // прыгает обратно.
+  const seekDraggingRef = useRef(false);
 
   const audioRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -54,6 +58,8 @@ export default function Room() {
   });
 
   // ---- sync logic ----
+  // Корректируем audio.currentTime только если расхождение > 0.2 с
+  // (порог из спецификации), чтобы избежать «дёрганий».
   const syncWithServer = useCallback((force = false, isTrackChange = false) => {
     const audio = audioRef.current;
     if (!audio) return;
@@ -68,7 +74,7 @@ export default function Room() {
     }
     if (isFinite(audio.currentTime)) {
       const drift = Math.abs(audio.currentTime - target);
-      if (force || isTrackChange || drift > 0.35) {
+      if (force || isTrackChange || drift > 0.2) {
         try {
           audio.currentTime = Math.max(0, target);
         } catch (err) {
@@ -181,8 +187,14 @@ export default function Room() {
   });
 
   // Tick + drift correction
+  // Не обновляем localTime, пока пользователь тащит ползунок перемотки.
   useEffect(() => {
     const id = setInterval(() => {
+      if (seekDraggingRef.current) {
+        // во время перетаскивания позиция управляется пользователем —
+        // ни локальное время, ни автоматический drift-correction не трогаем
+        return;
+      }
       const audio = audioRef.current;
       if (audio && !audio.paused) {
         setLocalTime(audio.currentTime || 0);
@@ -224,11 +236,27 @@ export default function Room() {
     }
   }, [roomState.track, roomState.playing, needsUserGesture, send]);
 
-  const handleSeekPreview = useCallback((v) => setLocalTime(v[0]), []);
+  const handleSeekPreview = useCallback((v) => {
+    // помечаем, что пользователь тащит ползунок, и обновляем визуальное
+    // положение без трогания audio.currentTime
+    seekDraggingRef.current = true;
+    setLocalTime(v[0]);
+  }, []);
 
   const handleSeekCommit = useCallback(
     (v) => {
+      seekDraggingRef.current = false;
       if (!roomState.track) return;
+      // Локально сразу переводим audio, чтобы перемотка ощущалась мгновенно;
+      // авторитетное значение придёт обратно от сервера событием `state`.
+      const audio = audioRef.current;
+      if (audio && isFinite(audio.duration)) {
+        try {
+          audio.currentTime = Math.max(0, Math.min(v[0], audio.duration));
+        } catch (err) {
+          console.warn("Room: local seek failed", err);
+        }
+      }
       send({ type: "seek", position: v[0] });
     },
     [roomState.track, send]
