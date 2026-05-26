@@ -4,6 +4,15 @@ import { Toaster } from "@/components/ui/sonner";
 import Login from "@/pages/Login";
 import Room from "@/pages/Room";
 
+const TOAST_OPTIONS = {
+  style: {
+    background: "rgba(24, 24, 27, 0.95)",
+    border: "1px solid rgba(255,255,255,0.08)",
+    color: "#fafafa",
+    backdropFilter: "blur(12px)",
+  },
+};
+
 function App() {
   return (
     <div className="App min-h-screen bg-zinc-950 text-zinc-100">
@@ -14,18 +23,7 @@ function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </BrowserRouter>
-      <Toaster
-        theme="dark"
-        position="top-right"
-        toastOptions={{
-          style: {
-            background: "rgba(24, 24, 27, 0.95)",
-            border: "1px solid rgba(255,255,255,0.08)",
-            color: "#fafafa",
-            backdropFilter: "blur(12px)",
-          },
-        }}
-      />
+      <Toaster theme="dark" position="top-right" toastOptions={TOAST_OPTIONS} />
     </div>
   );
 }

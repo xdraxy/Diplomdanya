@@ -3,20 +3,19 @@ import { useEffect, useRef, useState, useCallback } from "react";
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "";
 
 function buildWsUrl(code) {
-  // Преобразуем https://... -> wss://.../api/ws/<code>
   try {
     const url = new URL(BACKEND_URL);
     const wsProtocol = url.protocol === "https:" ? "wss:" : "ws:";
     return `${wsProtocol}//${url.host}/api/ws/${code}`;
-  } catch {
-    // относительный fallback
+  } catch (err) {
+    console.warn("useRoomSocket: invalid BACKEND_URL, falling back", err);
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     return `${wsProtocol}//${window.location.host}/api/ws/${code}`;
   }
 }
 
 export function useRoomSocket({ code, name, onMessage }) {
-  const [status, setStatus] = useState("connecting"); // connecting | connected | disconnected | error
+  const [status, setStatus] = useState("connecting");
   const wsRef = useRef(null);
   const reconnectTimer = useRef(null);
   const closedByUser = useRef(false);
@@ -28,7 +27,6 @@ export function useRoomSocket({ code, name, onMessage }) {
 
   const connect = useCallback(() => {
     if (!code || !name) return;
-    // Защита от двойного открытия (например, при React.StrictMode double-mount)
     const existing = wsRef.current;
     if (
       existing &&
@@ -50,11 +48,12 @@ export function useRoomSocket({ code, name, onMessage }) {
       try {
         const msg = JSON.parse(evt.data);
         if (handlerRef.current) handlerRef.current(msg);
-      } catch {
-        /* ignore */
+      } catch (err) {
+        console.warn("useRoomSocket: failed to parse message", err);
       }
     };
-    ws.onerror = () => {
+    ws.onerror = (err) => {
+      console.warn("useRoomSocket: socket error", err);
       setStatus("error");
     };
     ws.onclose = () => {
@@ -70,11 +69,12 @@ export function useRoomSocket({ code, name, onMessage }) {
     return () => {
       closedByUser.current = true;
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-      if (wsRef.current) {
+      const ws = wsRef.current;
+      if (ws) {
         try {
-          wsRef.current.close();
-        } catch {
-          /* ignore */
+          ws.close();
+        } catch (err) {
+          console.warn("useRoomSocket: close failed", err);
         }
       }
     };

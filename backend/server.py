@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import os
-import random
+import secrets
 import string
 import time
 from datetime import datetime, timezone
@@ -39,13 +39,13 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 МБ
 ROOM_CLEANUP_DELAY = 300  # 5 минут
 CHAT_HISTORY_MAX = 200
+ROOM_CODE_LENGTH = 6
+FILE_ID_LENGTH = 12
 
-# MongoDB
 mongo_url = os.environ["MONGO_URL"]
 mongo_client = AsyncIOMotorClient(mongo_url)
 db = mongo_client[os.environ["DB_NAME"]]
 
-# Логирование
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -56,21 +56,21 @@ app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 
+# =========================================================================
+# Room state
+# =========================================================================
 class Room:
     """In-memory состояние комнаты."""
 
     def __init__(self, code: str):
         self.code: str = code
-        # track = {file_path, url, title, artist, duration, uploaded_by, filename, cover_url}
         self.track: Optional[dict] = None
-        self.position: float = 0.0  # позиция при паузе ИЛИ позиция в момент play_started_at
+        self.position: float = 0.0
         self.play_started_at: Optional[float] = None
         self.playing: bool = False
         self.volume: float = 0.7
-        # ws_id -> websocket / name
         self.connections: Dict[str, WebSocket] = {}
         self.participants: Dict[str, str] = {}
-        self.uploader: Dict[str, str] = {}  # ws_id -> name, used for "host" marker (последний загрузивший)
         self.last_uploader: Optional[str] = None
         self.chat_history: List[dict] = []
         self.created_at: float = time.time()
@@ -110,16 +110,24 @@ class Room:
         }
 
 
-# Глобальные состояния
 rooms: Dict[str, Room] = {}
 cleanup_tasks: Dict[str, asyncio.Task] = {}
 
 
+# =========================================================================
+# Helpers
+# =========================================================================
 def generate_room_code() -> str:
+    """6-значный код комнаты (криптографически безопасный)."""
     while True:
-        code = "".join(random.choices(string.digits, k=6))
+        code = "".join(secrets.choice(string.digits) for _ in range(ROOM_CODE_LENGTH))
         if code not in rooms:
             return code
+
+
+def generate_file_id() -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(FILE_ID_LENGTH))
 
 
 def safe_str(value) -> str:
@@ -131,53 +139,61 @@ def safe_str(value) -> str:
         return ""
 
 
-def extract_metadata(file_path: Path, fallback_title: str) -> dict:
-    """Извлечь ID3-теги и обложку."""
-    title = fallback_title
-    artist = "Неизвестный исполнитель"
-    duration = 0.0
-    cover_url = None
-
+def _extract_id3_tags(file_path: Path) -> dict:
+    """Достаём title/artist/duration из MP3-метаданных."""
+    result = {"title": None, "artist": None, "duration": 0.0}
     try:
         audio = MP3(str(file_path))
-        duration = float(audio.info.length or 0)
+        result["duration"] = float(audio.info.length or 0)
         tags = audio.tags
         if tags:
-            if "TIT2" in tags:
-                t = safe_str(tags["TIT2"].text[0]) if tags["TIT2"].text else ""
+            if "TIT2" in tags and tags["TIT2"].text:
+                t = safe_str(tags["TIT2"].text[0])
                 if t:
-                    title = t
-            if "TPE1" in tags:
-                a = safe_str(tags["TPE1"].text[0]) if tags["TPE1"].text else ""
+                    result["title"] = t
+            if "TPE1" in tags and tags["TPE1"].text:
+                a = safe_str(tags["TPE1"].text[0])
                 if a:
-                    artist = a
+                    result["artist"] = a
     except Exception as e:
         logger.warning(f"MP3 metadata read failed: {e}")
+    return result
 
+
+def _extract_cover_art(file_path: Path) -> Optional[str]:
+    """Извлекаем APIC-обложку, сохраняем рядом с MP3, возвращаем URL."""
     try:
         id3 = ID3(str(file_path))
-        apic_frames = id3.getall("APIC")
-        if apic_frames:
-            apic = apic_frames[0]
-            mime = apic.mime or "image/jpeg"
-            ext = "jpg"
-            if "png" in mime:
-                ext = "png"
-            elif "jpeg" in mime or "jpg" in mime:
-                ext = "jpg"
-            cover_path = file_path.with_suffix(f".cover.{ext}")
-            with open(cover_path, "wb") as f:
-                f.write(apic.data)
-            cover_url = f"/api/files/{cover_path.name}"
     except ID3NoHeaderError:
-        pass
+        return None
     except Exception as e:
-        logger.warning(f"Cover extraction failed: {e}")
+        logger.warning(f"ID3 read failed: {e}")
+        return None
 
+    apic_frames = id3.getall("APIC")
+    if not apic_frames:
+        return None
+
+    apic = apic_frames[0]
+    mime = apic.mime or "image/jpeg"
+    ext = "png" if "png" in mime else "jpg"
+    cover_path = file_path.with_suffix(f".cover.{ext}")
+    try:
+        with open(cover_path, "wb") as f:
+            f.write(apic.data)
+    except Exception as e:
+        logger.warning(f"Cover write failed: {e}")
+        return None
+    return f"/api/files/{cover_path.name}"
+
+
+def extract_metadata(file_path: Path, fallback_title: str) -> dict:
+    tags = _extract_id3_tags(file_path)
+    cover_url = _extract_cover_art(file_path)
     return {
-        "title": title,
-        "artist": artist,
-        "duration": duration,
+        "title": tags["title"] or fallback_title,
+        "artist": tags["artist"] or "Неизвестный исполнитель",
+        "duration": tags["duration"],
         "cover_url": cover_url,
     }
 
@@ -220,16 +236,64 @@ async def cleanup_room_later(code: str) -> None:
             cleanup_tasks.pop(code, None)
             try:
                 await db.rooms.delete_one({"code": code})
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Mongo cleanup failed: {e}")
             logger.info(f"Room {code} cleaned up after inactivity")
     except asyncio.CancelledError:
         pass
 
 
-# ----------------------- REST endpoints -----------------------
+# =========================================================================
+# Upload helpers
+# =========================================================================
+def _validate_upload_filename(filename: str) -> None:
+    if not filename.lower().endswith(".mp3"):
+        raise HTTPException(status_code=400, detail="Принимаются только MP3 файлы")
 
 
+async def _read_upload_to_disk(file: UploadFile, dest: Path) -> None:
+    """Читаем upload по чанкам с проверкой лимита и пишем в файл."""
+    total = 0
+    with open(dest, "wb") as out:
+        while True:
+            chunk = await file.read(64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_FILE_SIZE:
+                out.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=413, detail="Файл слишком большой (макс 20 МБ)"
+                )
+            out.write(chunk)
+
+
+def _build_track_dict(
+    file_path: Path,
+    filename: str,
+    name: str,
+    meta: dict,
+) -> dict:
+    cover_path = None
+    if meta["cover_url"]:
+        cover_path = str(UPLOAD_DIR / Path(meta["cover_url"]).name)
+    return {
+        "file_path": str(file_path),
+        "cover_path": cover_path,
+        "url": f"/api/files/{file_path.name}",
+        "title": meta["title"],
+        "artist": meta["artist"],
+        "duration": meta["duration"],
+        "uploaded_by": name,
+        "filename": filename,
+        "cover_url": meta["cover_url"],
+    }
+
+
+# =========================================================================
+# REST
+# =========================================================================
 @api_router.get("/")
 async def root():
     return {"app": "syncplay", "ok": True}
@@ -241,10 +305,7 @@ async def create_room():
     rooms[code] = Room(code)
     try:
         await db.rooms.insert_one(
-            {
-                "code": code,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
+            {"code": code, "created_at": datetime.now(timezone.utc).isoformat()}
         )
     except Exception as e:
         logger.warning(f"Mongo insert failed: {e}")
@@ -268,54 +329,18 @@ async def upload_track(
         raise HTTPException(status_code=404, detail="Комната не найдена")
 
     filename = file.filename or "track.mp3"
-    if not filename.lower().endswith(".mp3"):
-        raise HTTPException(status_code=400, detail="Принимаются только MP3 файлы")
+    _validate_upload_filename(filename)
 
-    # Чтение с проверкой размера
-    chunks = []
-    total = 0
-    while True:
-        chunk = await file.read(1024 * 64)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=413, detail="Файл слишком большой (макс 20 МБ)"
-            )
-        chunks.append(chunk)
-
-    file_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
-    file_path = UPLOAD_DIR / f"{code}_{file_id}.mp3"
-    with open(file_path, "wb") as f:
-        for c in chunks:
-            f.write(c)
+    file_path = UPLOAD_DIR / f"{code}_{generate_file_id()}.mp3"
+    await _read_upload_to_disk(file, file_path)
 
     room = rooms[code]
-    # Удаляем старые файлы
     if room.track:
         remove_track_files(room.track)
 
     fallback_title = filename.rsplit(".", 1)[0]
     meta = extract_metadata(file_path, fallback_title)
-
-    cover_path = None
-    if meta["cover_url"]:
-        cover_path = str(
-            UPLOAD_DIR / Path(meta["cover_url"]).name
-        )  # /api/files/<name>
-
-    track = {
-        "file_path": str(file_path),
-        "cover_path": cover_path,
-        "url": f"/api/files/{file_path.name}",
-        "title": meta["title"],
-        "artist": meta["artist"],
-        "duration": meta["duration"],
-        "uploaded_by": name,
-        "filename": filename,
-        "cover_url": meta["cover_url"],
-    }
+    track = _build_track_dict(file_path, filename, name, meta)
 
     room.track = track
     room.last_uploader = name
@@ -323,19 +348,12 @@ async def upload_track(
     room.play_started_at = time.time()
     room.playing = True
 
-    await broadcast(
-        code,
-        {
-            "type": "track_change",
-            "state": room.state_dict(),
-        },
-    )
+    await broadcast(code, {"type": "track_change", "state": room.state_dict()})
     return {"ok": True, "track": room.state_dict()["track"]}
 
 
 @api_router.get("/files/{filename}")
 async def serve_file(filename: str):
-    # Запрещаем path traversal
     if "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Недопустимое имя файла")
     file_path = UPLOAD_DIR / filename
@@ -349,16 +367,109 @@ async def serve_file(filename: str):
     return FileResponse(str(file_path), media_type=media)
 
 
-# ----------------------- WebSocket -----------------------
+# =========================================================================
+# WebSocket message handlers
+# =========================================================================
+async def _handle_join(room: Room, ws_id: str, websocket: WebSocket, data: dict) -> str:
+    name = safe_str(data.get("name", "Гость"))[:50] or "Гость"
+    room.connections[ws_id] = websocket
+    room.participants[ws_id] = name
+    await websocket.send_json(
+        {
+            "type": "init",
+            "state": room.state_dict(),
+            "chat": room.chat_history[-50:],
+            "you": name,
+        }
+    )
+    await broadcast(
+        room.code,
+        {
+            "type": "participants",
+            "participants": list(room.participants.values()),
+            "joined": name,
+        },
+        exclude=ws_id,
+    )
+    return name
 
 
+async def _handle_play(room: Room, data: dict) -> None:
+    if room.track is None:
+        return
+    if not room.playing:
+        room.position = float(data.get("position", room.current_position()))
+        room.play_started_at = time.time()
+        room.playing = True
+    await broadcast(room.code, {"type": "state", "state": room.state_dict()})
+
+
+async def _handle_pause(room: Room) -> None:
+    if room.track is None:
+        return
+    if room.playing:
+        room.position = room.current_position()
+        room.playing = False
+        room.play_started_at = None
+    await broadcast(room.code, {"type": "state", "state": room.state_dict()})
+
+
+async def _handle_seek(room: Room, data: dict) -> None:
+    if room.track is None:
+        return
+    pos = float(data.get("position", 0.0))
+    duration = room.track.get("duration") or 0
+    if duration and pos > duration:
+        pos = duration
+    if pos < 0:
+        pos = 0
+    room.position = pos
+    if room.playing:
+        room.play_started_at = time.time()
+    await broadcast(room.code, {"type": "state", "state": room.state_dict()})
+
+
+async def _handle_volume(room: Room, name: Optional[str], data: dict) -> None:
+    vol = max(0.0, min(1.0, float(data.get("volume", 0.7))))
+    room.volume = vol
+    await broadcast(
+        room.code,
+        {"type": "volume", "volume": room.volume, "by": name or "Гость"},
+    )
+
+
+async def _handle_chat(room: Room, name: Optional[str], data: dict) -> None:
+    text = safe_str(data.get("text", ""))[:500]
+    if not text:
+        return
+    msg = {
+        "type": "chat",
+        "name": name or "Гость",
+        "text": text,
+        "ts": time.time(),
+    }
+    room.chat_history.append(msg)
+    if len(room.chat_history) > CHAT_HISTORY_MAX:
+        room.chat_history = room.chat_history[-CHAT_HISTORY_MAX:]
+    await broadcast(room.code, msg)
+
+
+async def _handle_sync_request(room: Room, websocket: WebSocket) -> None:
+    await websocket.send_json({"type": "sync", "state": room.state_dict()})
+
+
+async def _handle_ping(websocket: WebSocket) -> None:
+    await websocket.send_json({"type": "pong", "server_time": time.time()})
+
+
+# =========================================================================
+# WebSocket endpoint
+# =========================================================================
 @app.websocket("/api/ws/{code}")
 async def websocket_endpoint(websocket: WebSocket, code: str):
     await websocket.accept()
     if code not in rooms:
-        await websocket.send_json(
-            {"type": "error", "message": "Комната не найдена"}
-        )
+        await websocket.send_json({"type": "error", "message": "Комната не найдена"})
         await websocket.close()
         return
 
@@ -366,7 +477,6 @@ async def websocket_endpoint(websocket: WebSocket, code: str):
     ws_id = str(id(websocket))
     name: Optional[str] = None
 
-    # Если был запланирован cleanup — отменяем
     task = cleanup_tasks.pop(code, None)
     if task:
         task.cancel()
@@ -377,110 +487,24 @@ async def websocket_endpoint(websocket: WebSocket, code: str):
                 data = await websocket.receive_json()
             except json.JSONDecodeError:
                 continue
+
             mtype = data.get("type")
-
             if mtype == "join":
-                name = safe_str(data.get("name", "Гость"))[:50] or "Гость"
-                room.connections[ws_id] = websocket
-                room.participants[ws_id] = name
-                await websocket.send_json(
-                    {
-                        "type": "init",
-                        "state": room.state_dict(),
-                        "chat": room.chat_history[-50:],
-                        "you": name,
-                    }
-                )
-                await broadcast(
-                    code,
-                    {
-                        "type": "participants",
-                        "participants": list(room.participants.values()),
-                        "joined": name,
-                    },
-                    exclude=ws_id,
-                )
-
+                name = await _handle_join(room, ws_id, websocket, data)
             elif mtype == "play":
-                if room.track is None:
-                    continue
-                if not room.playing:
-                    room.position = float(
-                        data.get("position", room.current_position())
-                    )
-                    room.play_started_at = time.time()
-                    room.playing = True
-                await broadcast(
-                    code,
-                    {"type": "state", "state": room.state_dict()},
-                )
-
+                await _handle_play(room, data)
             elif mtype == "pause":
-                if room.track is None:
-                    continue
-                if room.playing:
-                    room.position = room.current_position()
-                    room.playing = False
-                    room.play_started_at = None
-                await broadcast(
-                    code,
-                    {"type": "state", "state": room.state_dict()},
-                )
-
+                await _handle_pause(room)
             elif mtype == "seek":
-                if room.track is None:
-                    continue
-                pos = float(data.get("position", 0.0))
-                duration = room.track.get("duration") or 0
-                if duration and pos > duration:
-                    pos = duration
-                if pos < 0:
-                    pos = 0
-                room.position = pos
-                if room.playing:
-                    room.play_started_at = time.time()
-                await broadcast(
-                    code,
-                    {"type": "state", "state": room.state_dict()},
-                )
-
+                await _handle_seek(room, data)
             elif mtype == "volume":
-                vol = float(data.get("volume", 0.7))
-                vol = max(0.0, min(1.0, vol))
-                room.volume = vol
-                await broadcast(
-                    code,
-                    {
-                        "type": "volume",
-                        "volume": room.volume,
-                        "by": name or "Гость",
-                    },
-                )
-
+                await _handle_volume(room, name, data)
             elif mtype == "chat":
-                text = safe_str(data.get("text", ""))[:500]
-                if not text:
-                    continue
-                msg = {
-                    "type": "chat",
-                    "name": name or "Гость",
-                    "text": text,
-                    "ts": time.time(),
-                }
-                room.chat_history.append(msg)
-                if len(room.chat_history) > CHAT_HISTORY_MAX:
-                    room.chat_history = room.chat_history[-CHAT_HISTORY_MAX:]
-                await broadcast(code, msg)
-
+                await _handle_chat(room, name, data)
             elif mtype == "sync_request":
-                await websocket.send_json(
-                    {"type": "sync", "state": room.state_dict()}
-                )
-
+                await _handle_sync_request(room, websocket)
             elif mtype == "ping":
-                await websocket.send_json(
-                    {"type": "pong", "server_time": time.time()}
-                )
+                await _handle_ping(websocket)
 
     except WebSocketDisconnect:
         pass
@@ -502,8 +526,9 @@ async def websocket_endpoint(websocket: WebSocket, code: str):
             cleanup_tasks[code] = asyncio.create_task(cleanup_room_later(code))
 
 
-# ----------------------- App setup -----------------------
-
+# =========================================================================
+# App setup
+# =========================================================================
 app.include_router(api_router)
 
 app.add_middleware(
