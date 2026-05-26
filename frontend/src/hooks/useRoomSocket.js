@@ -28,6 +28,15 @@ export function useRoomSocket({ code, name, onMessage }) {
 
   const connect = useCallback(() => {
     if (!code || !name) return;
+    // Защита от двойного открытия (например, при React.StrictMode double-mount)
+    const existing = wsRef.current;
+    if (
+      existing &&
+      (existing.readyState === WebSocket.CONNECTING ||
+        existing.readyState === WebSocket.OPEN)
+    ) {
+      return;
+    }
     closedByUser.current = false;
     setStatus("connecting");
     const ws = new WebSocket(buildWsUrl(code));
