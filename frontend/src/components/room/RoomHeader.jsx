@@ -1,8 +1,24 @@
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Music, Copy, Wifi, WifiOff, Loader2, LogOut, User } from "lucide-react";
+import {
+  Music,
+  Copy,
+  Wifi,
+  WifiOff,
+  Loader2,
+  LogOut,
+  User,
+  Share2,
+} from "lucide-react";
 
-export default function RoomHeader({ code, name, status, onCopyCode, onLeave }) {
+export default function RoomHeader({
+  code,
+  name,
+  status,
+  onCopyCode,
+  onLeave,
+  onShare,
+}) {
   return (
     <header
       className="flex flex-wrap items-center justify-between gap-3 px-4 md:px-6 py-3 bg-zinc-900/60 backdrop-blur-md border-b border-zinc-800"
@@ -68,6 +84,17 @@ export default function RoomHeader({ code, name, status, onCopyCode, onLeave }) 
           <User className="w-3 h-3 mr-1.5" />
           {name}
         </Badge>
+
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onShare}
+          data-testid="share-button"
+          className="text-cyan-400 hover:text-cyan-300 hover:bg-cyan-500/10"
+        >
+          <Share2 className="w-4 h-4 mr-1.5" />
+          Поделиться
+        </Button>
 
         <Button
           variant="ghost"

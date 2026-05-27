@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / ".env")
+
 from fastapi import (
     APIRouter,
     FastAPI,
@@ -31,8 +35,7 @@ from mutagen.id3 import ID3, ID3NoHeaderError
 from mutagen.mp3 import MP3
 from starlette.middleware.cors import CORSMiddleware
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / ".env")
+from auth import build_auth_router, make_auth_dependencies, setup_auth
 
 UPLOAD_DIR = ROOT_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -74,6 +77,7 @@ class Room:
         self.participants: Dict[str, str] = {}
         self.last_uploader: Optional[str] = None
         self.chat_history: List[dict] = []
+        self.queue: List[dict] = []  # очередь треков
         self.created_at: float = time.time()
 
     def current_position(self) -> float:
@@ -108,6 +112,16 @@ class Room:
             "server_time": time.time(),
             "participants": list(self.participants.values()),
             "last_uploader": self.last_uploader,
+            "queue": [
+                {
+                    "id": q["id"],
+                    "title": q["title"],
+                    "artist": q["artist"],
+                    "duration": q["duration"],
+                    "added_by": q.get("uploaded_by"),
+                }
+                for q in self.queue
+            ],
         }
 
 
@@ -325,6 +339,7 @@ async def upload_track(
     code: str,
     name: str = Form(...),
     file: UploadFile = File(...),
+    to_queue: bool = False,
 ):
     if code not in rooms:
         raise HTTPException(status_code=404, detail="Комната не найдена")
@@ -336,16 +351,23 @@ async def upload_track(
     await _read_upload_to_disk(file, file_path)
 
     room = rooms[code]
-    if room.track:
-        remove_track_files(room.track)
 
     fallback_title = filename.rsplit(".", 1)[0]
     meta = extract_metadata(file_path, fallback_title)
     track = _build_track_dict(file_path, filename, name, meta)
+    # уникальный id для управления в очереди
+    track["id"] = generate_file_id()
 
-    # Согласно спецификации: при загрузке нового трека сервер фиксирует
-    # current_time = 0 и is_playing = false. Пользователь должен явно
-    # нажать Play, чтобы запустить трек у всех.
+    # Если у комнаты УЖЕ есть текущий трек И запрошено добавление в очередь —
+    # кладём в очередь, текущий не трогаем.
+    if to_queue and room.track is not None:
+        room.queue.append(track)
+        await broadcast(code, {"type": "queue_update", "state": room.state_dict()})
+        return {"ok": True, "queued": True, "track": track}
+
+    # Иначе — заменяем текущий трек (старый удаляем с диска).
+    if room.track:
+        remove_track_files(room.track)
     room.track = track
     room.last_uploader = name
     room.position = 0.0
@@ -353,7 +375,7 @@ async def upload_track(
     room.playing = False
 
     await broadcast(code, {"type": "track_change", "state": room.state_dict()})
-    return {"ok": True, "track": room.state_dict()["track"]}
+    return {"ok": True, "queued": False, "track": room.state_dict()["track"]}
 
 
 @api_router.get("/files/{filename}")
@@ -518,6 +540,38 @@ async def _handle_sync_request(room: Room, websocket: WebSocket) -> None:
     await websocket.send_json({"type": "sync", "state": room.state_dict()})
 
 
+async def _handle_next_track(room: Room) -> None:
+    """Переключение на следующий трек из очереди. Текущий удаляется."""
+    if not room.queue:
+        return
+    # удаляем файлы старого трека
+    if room.track:
+        remove_track_files(room.track)
+    # достаём первый из очереди и делаем текущим
+    next_item = room.queue.pop(0)
+    room.track = next_item
+    room.last_uploader = next_item.get("uploaded_by")
+    room.position = 0.0
+    room.play_started_at = time.time()
+    room.playing = True  # очередь автоматически продолжается
+    await broadcast(room.code, {"type": "track_change", "state": room.state_dict()})
+
+
+async def _handle_queue_remove(room: Room, data: dict) -> None:
+    qid = data.get("id")
+    if not qid:
+        return
+    removed = None
+    for i, item in enumerate(room.queue):
+        if item.get("id") == qid:
+            removed = room.queue.pop(i)
+            break
+    if removed:
+        # удаляем файлы
+        remove_track_files(removed)
+        await broadcast(room.code, {"type": "queue_update", "state": room.state_dict()})
+
+
 async def _handle_ping(websocket: WebSocket) -> None:
     await websocket.send_json({"type": "pong", "server_time": time.time()})
 
@@ -563,6 +617,10 @@ async def websocket_endpoint(websocket: WebSocket, code: str):
                 await _handle_chat(room, name, data)
             elif mtype == "sync_request":
                 await _handle_sync_request(room, websocket)
+            elif mtype == "next_track":
+                await _handle_next_track(room)
+            elif mtype == "queue_remove":
+                await _handle_queue_remove(room, data)
             elif mtype == "ping":
                 await _handle_ping(websocket)
 
@@ -591,13 +649,30 @@ async def websocket_endpoint(websocket: WebSocket, code: str):
 # =========================================================================
 app.include_router(api_router)
 
+# Auth: подключаем роутер /api/auth/* (register, login, me, refresh, logout)
+def _get_db():
+    return db
+
+
+get_current_user_required, get_current_user_optional = make_auth_dependencies(_get_db)
+app.include_router(build_auth_router(_get_db, get_current_user_required))
+
+# CORS: с allow_credentials=True wildcard "*" недопустим — браузер блокирует.
+# Перечисляем явные origin'ы (из CORS_ORIGINS, через запятую).
+_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_origins=_origins or ["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_event():
+    await setup_auth(db)
+    logger.info("Auth: индексы созданы, admin засеялся")
 
 
 @app.on_event("shutdown")

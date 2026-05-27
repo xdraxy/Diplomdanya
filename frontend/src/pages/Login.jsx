@@ -1,50 +1,80 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import axios from "axios";
 import { toast } from "sonner";
-import { Music, ArrowRight, Loader2, Plus, LogIn } from "lucide-react";
+import {
+  Music,
+  ArrowRight,
+  Loader2,
+  Plus,
+  LogIn,
+  UserPlus,
+  Users,
+  LogOut,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Card } from "@/components/ui/card";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+import { useAuth, formatApiError } from "@/context/AuthContext";
 
+const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 const NAME_REGEX = /^[a-zA-Zа-яА-ЯёЁ0-9 .\-_]+$/;
 
 export default function Login() {
   const navigate = useNavigate();
-  const [name, setName] = useState(
+  const { user, isAuthenticated, isChecking, login, register, logout } =
+    useAuth();
+
+  // Гостевое имя (если пользователь не вошёл)
+  const [guestName, setGuestName] = useState(
     () => localStorage.getItem("syncplay_name") || ""
   );
   const [code, setCode] = useState("");
+
+  // Поля авторизации
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authDisplayName, setAuthDisplayName] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+
   const [creating, setCreating] = useState(false);
   const [joining, setJoining] = useState(false);
 
-  const validateName = () => {
-    const trimmed = name.trim();
+  // Когда пользователь авторизуется — синхронизируем guestName с его display_name
+  useEffect(() => {
+    if (user && user.display_name) {
+      setGuestName(user.display_name);
+      localStorage.setItem("syncplay_name", user.display_name);
+    }
+  }, [user]);
+
+  const resolveName = () => {
+    if (isAuthenticated && user?.display_name) return user.display_name;
+    const trimmed = guestName.trim();
     if (trimmed.length < 2) {
       toast.error("Введите имя минимум из 2 символов");
       return null;
     }
     if (!NAME_REGEX.test(trimmed)) {
-      toast.error("Имя может содержать только русские/английские буквы и цифры");
+      toast.error("Имя: только русские/английские буквы и цифры");
       return null;
     }
     return trimmed;
   };
 
   const handleCreate = async () => {
-    const validName = validateName();
-    if (!validName) return;
+    const name = resolveName();
+    if (!name) return;
     setCreating(true);
     try {
       const { data } = await axios.post(`${API}/rooms`);
-      localStorage.setItem("syncplay_name", validName);
+      localStorage.setItem("syncplay_name", name);
       toast.success(`Комната создана: ${data.code}`);
       navigate(`/room/${data.code}`);
-    } catch (e) {
+    } catch {
       toast.error("Не удалось создать комнату");
     } finally {
       setCreating(false);
@@ -52,8 +82,8 @@ export default function Login() {
   };
 
   const handleJoin = async () => {
-    const validName = validateName();
-    if (!validName) return;
+    const name = resolveName();
+    if (!name) return;
     const clean = code.replace(/\D/g, "");
     if (clean.length !== 6) {
       toast.error("Код комнаты должен состоять из 6 цифр");
@@ -62,18 +92,66 @@ export default function Login() {
     setJoining(true);
     try {
       await axios.get(`${API}/rooms/${clean}`);
-      localStorage.setItem("syncplay_name", validName);
+      localStorage.setItem("syncplay_name", name);
       navigate(`/room/${clean}`);
     } catch (e) {
-      if (e?.response?.status === 404) {
-        toast.error("Комната не найдена");
-      } else {
-        toast.error("Не удалось войти в комнату");
-      }
+      if (e?.response?.status === 404) toast.error("Комната не найдена");
+      else toast.error("Не удалось войти в комнату");
     } finally {
       setJoining(false);
     }
   };
+
+  const handleLogin = async () => {
+    if (!authEmail || !authPassword) {
+      toast.error("Заполните все поля");
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      await login(authEmail.trim(), authPassword);
+      toast.success("Вы вошли");
+      setAuthEmail("");
+      setAuthPassword("");
+    } catch (e) {
+      toast.error(formatApiError(e?.response?.data?.detail) || "Ошибка входа");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleRegister = async () => {
+    if (!authEmail || !authPassword || !authDisplayName) {
+      toast.error("Заполните все поля");
+      return;
+    }
+    if (authPassword.length < 6) {
+      toast.error("Пароль должен быть не менее 6 символов");
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      await register(authEmail.trim(), authPassword, authDisplayName.trim());
+      toast.success("Регистрация прошла успешно");
+      setAuthEmail("");
+      setAuthPassword("");
+      setAuthDisplayName("");
+    } catch (e) {
+      toast.error(
+        formatApiError(e?.response?.data?.detail) || "Ошибка регистрации"
+      );
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  if (isChecking) {
+    return (
+      <div className="app-bg grid-bg min-h-screen flex items-center justify-center">
+        <Loader2 className="w-8 h-8 animate-spin text-cyan-500" />
+      </div>
+    );
+  }
 
   return (
     <div
@@ -81,7 +159,6 @@ export default function Login() {
       data-testid="login-page"
     >
       <div className="w-full max-w-md fade-up">
-        {/* Логотип / Заголовок */}
         <div className="flex items-center justify-center gap-3 mb-8">
           <div className="w-12 h-12 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center">
             <Music className="w-6 h-6 text-cyan-400" />
@@ -96,23 +173,158 @@ export default function Login() {
           </div>
         </div>
 
-        <Card className="bg-zinc-900/70 backdrop-blur-md border border-zinc-800 rounded-2xl shadow-2xl p-6">
-          <div className="mb-5">
-            <label className="block text-xs uppercase tracking-[0.1em] text-zinc-500 mb-2">
-              Ваше имя
-            </label>
-            <Input
-              data-testid="login-name-input"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="Например, Алексей"
-              maxLength={50}
-              className="bg-zinc-950/60 border-zinc-700 text-white placeholder:text-zinc-500 focus-visible:ring-1 focus-visible:ring-cyan-500 focus-visible:border-cyan-500 rounded-lg h-12"
-            />
-            <p className="mt-1.5 text-xs text-zinc-500">
-              Русские/английские буквы, цифры
-            </p>
+        {/* Информация о текущем аккаунте */}
+        {isAuthenticated && (
+          <div
+            className="mb-4 flex items-center justify-between gap-3 px-4 py-3 rounded-xl bg-zinc-900/70 border border-cyan-500/30"
+            data-testid="auth-summary"
+          >
+            <div className="min-w-0">
+              <div className="text-[10px] uppercase tracking-[0.2em] text-cyan-500">
+                Вы вошли как
+              </div>
+              <div className="text-sm text-white truncate">
+                {user.display_name}{" "}
+                <span className="text-zinc-500 text-xs">({user.email})</span>
+              </div>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={async () => {
+                await logout();
+                toast("Вы вышли");
+              }}
+              className="text-zinc-400 hover:text-red-400 hover:bg-red-500/10 shrink-0"
+              data-testid="logout-button"
+            >
+              <LogOut className="w-4 h-4" />
+            </Button>
           </div>
+        )}
+
+        <Card className="bg-zinc-900/70 backdrop-blur-md border border-zinc-800 rounded-2xl shadow-2xl p-6">
+          {/* Если не вошёл — показываем поле «гостевое имя» + табы (вход/рег) */}
+          {!isAuthenticated && (
+            <>
+              <div className="mb-4">
+                <label className="block text-xs uppercase tracking-[0.1em] text-zinc-500 mb-2">
+                  Ваше имя (гость)
+                </label>
+                <Input
+                  data-testid="login-name-input"
+                  value={guestName}
+                  onChange={(e) => setGuestName(e.target.value)}
+                  placeholder="Например, Алексей"
+                  maxLength={50}
+                  className="bg-zinc-950/60 border-zinc-700 text-white placeholder:text-zinc-500 focus-visible:ring-1 focus-visible:ring-cyan-500 focus-visible:border-cyan-500 rounded-lg h-11"
+                />
+              </div>
+
+              <details
+                className="mb-4 group"
+                data-testid="auth-collapsible"
+              >
+                <summary className="cursor-pointer text-xs uppercase tracking-[0.1em] text-cyan-500 hover:text-cyan-400 select-none flex items-center gap-2">
+                  <UserPlus className="w-3.5 h-3.5" />
+                  Войти или зарегистрироваться (не обязательно)
+                </summary>
+
+                <div className="mt-4">
+                  <Tabs defaultValue="signin" className="w-full">
+                    <TabsList className="grid w-full grid-cols-2 bg-zinc-950/60 border border-zinc-800">
+                      <TabsTrigger
+                        value="signin"
+                        data-testid="tab-signin"
+                        className="data-[state=active]:bg-cyan-500 data-[state=active]:text-black"
+                      >
+                        Вход
+                      </TabsTrigger>
+                      <TabsTrigger
+                        value="signup"
+                        data-testid="tab-signup"
+                        className="data-[state=active]:bg-cyan-500 data-[state=active]:text-black"
+                      >
+                        Регистрация
+                      </TabsTrigger>
+                    </TabsList>
+
+                    <TabsContent value="signin" className="mt-3 space-y-2">
+                      <Input
+                        data-testid="signin-email"
+                        type="email"
+                        placeholder="E-mail"
+                        value={authEmail}
+                        onChange={(e) => setAuthEmail(e.target.value)}
+                        className="bg-zinc-950/60 border-zinc-700 text-white h-10 rounded-lg"
+                      />
+                      <Input
+                        data-testid="signin-password"
+                        type="password"
+                        placeholder="Пароль"
+                        value={authPassword}
+                        onChange={(e) => setAuthPassword(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && handleLogin()}
+                        className="bg-zinc-950/60 border-zinc-700 text-white h-10 rounded-lg"
+                      />
+                      <Button
+                        data-testid="signin-submit"
+                        onClick={handleLogin}
+                        disabled={authBusy}
+                        className="w-full h-10 bg-zinc-800 hover:bg-zinc-700 text-white"
+                      >
+                        {authBusy ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          "Войти"
+                        )}
+                      </Button>
+                    </TabsContent>
+
+                    <TabsContent value="signup" className="mt-3 space-y-2">
+                      <Input
+                        data-testid="signup-name"
+                        placeholder="Отображаемое имя"
+                        value={authDisplayName}
+                        onChange={(e) => setAuthDisplayName(e.target.value)}
+                        maxLength={50}
+                        className="bg-zinc-950/60 border-zinc-700 text-white h-10 rounded-lg"
+                      />
+                      <Input
+                        data-testid="signup-email"
+                        type="email"
+                        placeholder="E-mail"
+                        value={authEmail}
+                        onChange={(e) => setAuthEmail(e.target.value)}
+                        className="bg-zinc-950/60 border-zinc-700 text-white h-10 rounded-lg"
+                      />
+                      <Input
+                        data-testid="signup-password"
+                        type="password"
+                        placeholder="Пароль (минимум 6 символов)"
+                        value={authPassword}
+                        onChange={(e) => setAuthPassword(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && handleRegister()}
+                        className="bg-zinc-950/60 border-zinc-700 text-white h-10 rounded-lg"
+                      />
+                      <Button
+                        data-testid="signup-submit"
+                        onClick={handleRegister}
+                        disabled={authBusy}
+                        className="w-full h-10 bg-zinc-800 hover:bg-zinc-700 text-white"
+                      >
+                        {authBusy ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          "Создать аккаунт"
+                        )}
+                      </Button>
+                    </TabsContent>
+                  </Tabs>
+                </div>
+              </details>
+            </>
+          )}
 
           <Tabs defaultValue="create" className="w-full">
             <TabsList className="grid w-full grid-cols-2 bg-zinc-950/60 border border-zinc-800">
@@ -167,9 +379,7 @@ export default function Login() {
                 onChange={(e) =>
                   setCode(e.target.value.replace(/\D/g, "").slice(0, 6))
                 }
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") handleJoin();
-                }}
+                onKeyDown={(e) => e.key === "Enter" && handleJoin()}
                 placeholder="123456"
                 inputMode="numeric"
                 maxLength={6}

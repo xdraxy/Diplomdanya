@@ -1,0 +1,65 @@
+{
+  "summary": "Iteration 5 testing — Auth (JWT) + Queue + Share dialog + Unread chat badge. Backend: 40/41 pytest tests pass. Frontend: all major flows verified (admin login, guest mode, room creation, share dialog with QR, sidebar tabs, queue upload). One CRITICAL backend bug found: brute-force lockout raises TypeError (naive vs aware datetime) → 500 instead of 429, and per-IP identifier rotates across K8s ingress pods so lockout never engages through the public URL.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/auth/login (brute-force lockout)",
+        "issue": "Two bugs combine to disable lockout: (1) In auth.py:_check_lockout, `locked_until` returned from MongoDB is tz-naive but compared to `datetime.now(timezone.utc)` (aware) → TypeError → 500 (visible at /var/log/supervisor/backend.err.log: `can't compare offset-naive and offset-aware datetimes`). Confirmed locally: 5 wrong logins return 401, 6th and onward return 500 instead of 429. (2) The lockout identifier uses `request.client.host` which behind the K8s ingress varies between pod IPs (observed `10.208.130.77` and `10.208.130.78` in `db.login_attempts` for the same email in the same brute-force run) — so the per-`ip:email` counter never reaches 5 through the public URL, allowing unlimited attempts. Fix: in _check_lockout, normalize `locked_until = locked_until.replace(tzinfo=timezone.utc) if locked_until.tzinfo is None else locked_until`. For proxy: parse `X-Forwarded-For` (first IP) before falling back to `request.client.host`, or drop IP and key on email alone.",
+        "priority": "CRITICAL"
+      }
+    ],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "useRoomSocket",
+        "issue": "Initial WS connection logs `WebSocket is closed before the connection is established.` warning in console (React 18 StrictMode double-mount artifact). App still connects and shows 'Синхронизировано'. Cosmetic only.",
+        "selector": "n/a",
+        "priority": "LOW"
+      },
+      {
+        "component": "RoomHeader logout (Выйти) button",
+        "issue": "The 'Выйти' (leave room) button in RoomHeader has data-testid='leave-room-button' (correct) but the AUTH logout button (clears JWT cookies) is only on Login page (data-testid='logout-button'). When an authenticated user is inside a room, clicking 'Выйти' only leaves the room — they remain logged in. This appears intentional but is a UX consideration.",
+        "selector": "[data-testid='leave-room-button']",
+        "priority": "LOW"
+      }
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_auth.py",
+    "/app/backend/tests/test_queue.py",
+    "/app/backend/tests/test_syncplay.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Fix _check_lockout naive-vs-aware datetime comparison in /app/backend/auth.py:175 (TypeError → 500 on 6th wrong login attempt).",
+    "Fix brute-force IP detection: parse X-Forwarded-For header (or trust proxy) so identifier doesn't rotate across K8s ingress pod IPs — otherwise lockout never triggers in production.",
+    "Optional: also lock by email-only (not just ip+email) as a second guard against distributed brute-force."
+  ],
+  "critical_code_review_comments": [
+    "auth.py uses `datetime.now(timezone.utc)` but stores via Motor/PyMongo which strips tzinfo on read — anywhere these are compared (locked_until check, login_attempts.updated_at) must normalize after read.",
+    "server.py `Room.state_dict()` exposes `track` without `id` field but `queue` items DO include `id`. This asymmetry is fine for current use but should be documented; clients can't refer to current track by id (e.g. to insert next).",
+    "server.py is 683 lines and growing — consider splitting room CRUD, upload, and WS handlers into separate modules.",
+    "Frontend Room.jsx is 611 lines — consider extracting useRoomState/useWebSocketHandlers.",
+    "Cloudflare/ingress sets `access-control-allow-origin: *` overriding the FastAPI CORS middleware. With credentials, browsers will reject `*` — but in this preview env httpOnly cookies still set because they're same-origin (proxied). Confirm production environment passes explicit origin header through ingress."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_auth.py (created)",
+    "/app/backend/tests/test_queue.py (created)"
+  ],
+  "success_rate": {"backend": "97% (40/41)", "frontend": "100% of tested flows"},
+  "test_credentials": "Admin: admin@syncplay.ru / admin123 (loaded from /app/memory/test_credentials.md)",
+  "seed_data_creation": "Tests create rooms and register users with `test_` prefix; no cleanup required (in-memory rooms; users persisted but isolated).",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend tests live in /app/backend/tests/{test_syncplay.py,test_auth.py,test_queue.py}. Run with `pytest backend/tests/ -v`. The lockout test (TestLogin::test_login_brute_force_lockout_429) will keep failing until the IP/tz fix lands. Auth login/register/me/logout/refresh, queue upload-to-queue, ws next_track and queue_remove, room state queue field — all verified passing. Frontend testids of interest: tab-chat / tab-queue / tab-participants / unread-badge / queue-add-input / share-button / share-dialog / signin-submit / signup-* / logout-button / author-credit / auth-summary.",
+  "rca_of_the_issue": {
+    "bug": "Brute-force lockout returns 500 on 6th attempt and never 429 in production.",
+    "reproduction": "1) `for i in 1..7: curl -X POST http://localhost:8001/api/auth/login -d '{\"email\":\"x@y.z\",\"password\":\"wrong\"}'`. Locally: statuses=[401,401,401,401,401,500,500]. 2) Same via public URL: all 401 (no lockout) because ingress rotates client IP across pods (verified by inspecting db.login_attempts — two records with `10.208.130.77:x@y.z` and `10.208.130.78:x@y.z`).",
+    "root_cause": "(a) MongoDB returns datetime without tzinfo; auth.py compares it to `datetime.now(timezone.utc)` (aware) → TypeError. (b) `request.client.host` reflects the immediate TCP peer (ingress pod) rather than the real client IP; ingress uses round-robin across pods so identifier varies.",
+    "mitigation": "Patch /app/backend/auth.py _check_lockout: assume UTC if naive. For IP, use `request.headers.get('x-forwarded-for','').split(',')[0].strip() or request.client.host` and consider supplementing with an email-only counter."
+  }
+}

@@ -4,13 +4,16 @@ import axios from "axios";
 import { toast } from "sonner";
 
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { Users, MessageSquare } from "lucide-react";
+import { Users, MessageSquare, ListMusic } from "lucide-react";
 
 import { useRoomSocket } from "@/hooks/useRoomSocket";
+import { useAuth } from "@/context/AuthContext";
 import RoomHeader from "@/components/room/RoomHeader";
 import AudioPlayer from "@/components/room/AudioPlayer";
 import ChatPanel from "@/components/room/ChatPanel";
 import ParticipantsList from "@/components/room/ParticipantsList";
+import QueuePanel from "@/components/room/QueuePanel";
+import ShareDialog from "@/components/room/ShareDialog";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "";
 const API = `${BACKEND_URL}/api`;
@@ -22,15 +25,18 @@ const INITIAL_STATE = {
   volume: 0.7,
   participants: [],
   last_uploader: null,
+  queue: [],
 };
 
 export default function Room() {
   const { code } = useParams();
   const navigate = useNavigate();
-  const name = useMemo(
-    () => localStorage.getItem("syncplay_name") || "",
-    []
-  );
+  const { user } = useAuth();
+  // Имя в комнате: для авторизованных — display_name, иначе из localStorage
+  const name = useMemo(() => {
+    if (user && user.display_name) return user.display_name;
+    return localStorage.getItem("syncplay_name") || "";
+  }, [user]);
 
   useEffect(() => {
     if (!name) navigate("/");
@@ -41,13 +47,18 @@ export default function Room() {
   const [chatDraft, setChatDraft] = useState("");
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
+  const [queueUploading, setQueueUploading] = useState(false);
   const [audioReady, setAudioReady] = useState(false);
   const [needsUserGesture, setNeedsUserGesture] = useState(false);
   const [localTime, setLocalTime] = useState(0);
-  // Когда пользователь тащит ползунок перемотки, локальный «тик» не должен
-  // перезаписывать localTime значением audio.currentTime — иначе ползунок
-  // прыгает обратно.
+  // Бейдж непрочитанных сообщений: счётчик новых сообщений, пока активна
+  // НЕ вкладка чата. Сбрасывается на 0 при переключении на чат.
+  const [activeSidebarTab, setActiveSidebarTab] = useState("chat");
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [shareOpen, setShareOpen] = useState(false);
   const seekDraggingRef = useRef(false);
+  // ref-зеркало activeSidebarTab — нужно внутри handleSocketMessage (useCallback с [])
+  const activeSidebarTabRef = useRef("chat");
 
   const audioRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -113,6 +124,7 @@ export default function Room() {
         volume: state.volume,
         participants: state.participants,
         last_uploader: state.last_uploader,
+        queue: state.queue || prev.queue,
       }));
       stateMetaRef.current = {
         serverPos: state.position || 0,
@@ -142,6 +154,12 @@ export default function Room() {
     [syncWithServer]
   );
 
+  // Синхронизируем ref с state
+  useEffect(() => {
+    activeSidebarTabRef.current = activeSidebarTab;
+    if (activeSidebarTab === "chat") setUnreadCount(0);
+  }, [activeSidebarTab]);
+
   const handleSocketMessage = useCallback(
     (msg) => {
       if (!msg || !msg.type) return;
@@ -154,6 +172,10 @@ export default function Room() {
         case "track_change":
         case "sync":
           applyState(msg.state, msg.type === "track_change");
+          break;
+        case "queue_update":
+          // обновляем только очередь, без сброса позиции/playing
+          setRoomState((s) => ({ ...s, queue: msg.state.queue || [] }));
           break;
         case "volume":
           setRoomState((s) => ({ ...s, volume: msg.volume }));
@@ -175,6 +197,11 @@ export default function Room() {
           break;
         case "chat":
           setChatMessages((m) => [...m, msg]);
+          // если чат сейчас не активная вкладка — увеличиваем счётчик
+          // непрочитанных (сами свои сообщения не считаем)
+          if (msg.name !== name) {
+            setUnreadCount((c) => (activeSidebarTabRef.current === "chat" ? 0 : c + 1));
+          }
           break;
         case "error":
           toast.error(msg.message || "Ошибка");
@@ -376,6 +403,42 @@ export default function Room() {
     }
   }, [code]);
 
+  // Добавление трека В ОЧЕРЕДЬ (использует ?to_queue=true)
+  const handleQueueUpload = useCallback(
+    async (file) => {
+      if (!file) return;
+      if (!file.name.toLowerCase().endsWith(".mp3")) {
+        toast.error("Принимаются только MP3 файлы");
+        return;
+      }
+      if (file.size > 20 * 1024 * 1024) {
+        toast.error("Файл больше 20 МБ");
+        return;
+      }
+      const form = new FormData();
+      form.append("name", name);
+      form.append("file", file);
+      setQueueUploading(true);
+      try {
+        await axios.post(`${API}/rooms/${code}/upload?to_queue=true`, form);
+        toast.success("Трек добавлен в очередь");
+      } catch (e) {
+        console.warn("Room: queue upload failed", e);
+        toast.error(e?.response?.data?.detail || "Не удалось загрузить");
+      } finally {
+        setQueueUploading(false);
+      }
+    },
+    [code, name]
+  );
+
+  const handleQueueRemove = useCallback(
+    (id) => send({ type: "queue_remove", id }),
+    [send]
+  );
+
+  const handleShare = useCallback(() => setShareOpen(true), []);
+
   const handleLeave = useCallback(() => navigate("/"), [navigate]);
 
   const handleUploadClick = useCallback(
@@ -393,9 +456,13 @@ export default function Room() {
     [syncWithServer]
   );
 
-  // При окончании трека: оптимистично обновляем локальное состояние, чтобы
-  // тик не пытался снова запустить воспроизведение до ответа сервера.
+  // При окончании трека: если в очереди что-то есть — переключаемся на
+  // следующий трек (сервер пересоберёт state); иначе фиксируем паузу.
   const handleAudioEnded = useCallback(() => {
+    if (roomState.queue && roomState.queue.length > 0) {
+      send({ type: "next_track" });
+      return;
+    }
     const dur = audioRef.current?.duration || 0;
     stateMetaRef.current = {
       serverPos: dur,
@@ -404,7 +471,7 @@ export default function Room() {
     };
     setRoomState((s) => ({ ...s, playing: false, position: dur }));
     send({ type: "pause" });
-  }, [send]);
+  }, [send, roomState.queue]);
 
   return (
     <div className="app-bg grid-bg min-h-screen flex flex-col" data-testid="room-page">
@@ -422,6 +489,7 @@ export default function Room() {
         status={status}
         onCopyCode={handleCopyCode}
         onLeave={handleLeave}
+        onShare={handleShare}
       />
 
       <main className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-4 p-4 min-h-0">
@@ -453,17 +521,40 @@ export default function Room() {
         </section>
 
         <aside className="lg:col-span-4 flex flex-col gap-4 min-h-0 fade-up" data-testid="sidebar">
-          <Tabs defaultValue="chat" className="flex-1 flex flex-col min-h-0">
-            <TabsList className="grid grid-cols-2 bg-zinc-900/60 border border-zinc-800">
+          <Tabs
+            value={activeSidebarTab}
+            onValueChange={setActiveSidebarTab}
+            className="flex-1 flex flex-col min-h-0"
+          >
+            <TabsList className="grid grid-cols-3 bg-zinc-900/60 border border-zinc-800">
               <TabsTrigger
                 value="chat"
                 data-testid="tab-chat"
-                className="data-[state=active]:bg-cyan-500 data-[state=active]:text-black"
+                className="relative data-[state=active]:bg-cyan-500 data-[state=active]:text-black"
               >
                 <MessageSquare className="w-4 h-4 mr-1.5" />
                 Чат
                 <span className="ml-1.5 text-xs opacity-70">
                   {chatMessages.length}
+                </span>
+                {unreadCount > 0 && activeSidebarTab !== "chat" && (
+                  <span
+                    className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center shadow-lg"
+                    data-testid="unread-badge"
+                  >
+                    {unreadCount > 99 ? "99+" : unreadCount}
+                  </span>
+                )}
+              </TabsTrigger>
+              <TabsTrigger
+                value="queue"
+                data-testid="tab-queue"
+                className="data-[state=active]:bg-cyan-500 data-[state=active]:text-black"
+              >
+                <ListMusic className="w-4 h-4 mr-1.5" />
+                Очередь
+                <span className="ml-1.5 text-xs opacity-70">
+                  {roomState.queue.length}
                 </span>
               </TabsTrigger>
               <TabsTrigger
@@ -472,7 +563,7 @@ export default function Room() {
                 className="data-[state=active]:bg-cyan-500 data-[state=active]:text-black"
               >
                 <Users className="w-4 h-4 mr-1.5" />
-                Участники
+                Гости
                 <span className="ml-1.5 text-xs opacity-70">
                   {roomState.participants.length}
                 </span>
@@ -489,6 +580,15 @@ export default function Room() {
               />
             </TabsContent>
 
+            <TabsContent value="queue" className="flex-1 mt-3 min-h-0">
+              <QueuePanel
+                queue={roomState.queue}
+                uploading={queueUploading}
+                onAddToQueue={handleQueueUpload}
+                onRemove={handleQueueRemove}
+              />
+            </TabsContent>
+
             <TabsContent value="participants" className="flex-1 mt-3 min-h-0">
               <ParticipantsList
                 participants={roomState.participants}
@@ -499,6 +599,12 @@ export default function Room() {
           </Tabs>
         </aside>
       </main>
+
+      <ShareDialog
+        open={shareOpen}
+        onOpenChange={setShareOpen}
+        code={code}
+      />
     </div>
   );
 }
