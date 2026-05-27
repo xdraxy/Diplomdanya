@@ -16,14 +16,12 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_MIN = 60 * 24       # 1 день (для удобства SPA — обновляется при перезаходе)
-REFRESH_TOKEN_DAYS = 30          # 30 дней
+ACCESS_TOKEN_MIN = 60 * 24
+REFRESH_TOKEN_DAYS = 30
 
 NAME_REGEX = re.compile(r"^[a-zA-Zа-яА-ЯёЁ0-9 .\-_]{2,50}$")
 
-# ---------------------------------------------------------------------------
-# Хелперы
-# ---------------------------------------------------------------------------
+
 def hash_password(password: str) -> str:
     salt = bcrypt.gensalt()
     return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
@@ -104,12 +102,7 @@ def _public_user(doc: dict) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Зависимости FastAPI
-# ---------------------------------------------------------------------------
 def make_auth_dependencies(get_db):
-    """Возвращает (get_current_user_required, get_current_user_optional)."""
-
     async def required(request: Request) -> dict:
         db = get_db()
         token = _extract_token(request)
@@ -137,9 +130,6 @@ def make_auth_dependencies(get_db):
     return required, optional
 
 
-# ---------------------------------------------------------------------------
-# Pydantic схемы
-# ---------------------------------------------------------------------------
 class RegisterPayload(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6, max_length=128)
@@ -159,9 +149,6 @@ class LoginPayload(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
-# ---------------------------------------------------------------------------
-# Brute force защита
-# ---------------------------------------------------------------------------
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_MINUTES = 15
 
@@ -177,7 +164,6 @@ async def _check_lockout(db, identifier: str) -> None:
                 status_code=429,
                 detail="Слишком много неудачных попыток. Попробуйте через 15 минут.",
             )
-        # окно прошло — сбрасываем
         await db.login_attempts.delete_one({"identifier": identifier})
 
 
@@ -197,9 +183,6 @@ async def _clear_failures(db, identifier: str) -> None:
     await db.login_attempts.delete_one({"identifier": identifier})
 
 
-# ---------------------------------------------------------------------------
-# Router builder
-# ---------------------------------------------------------------------------
 def build_auth_router(get_db, get_current_user_required):
     router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -293,16 +276,11 @@ def build_auth_router(get_db, get_current_user_required):
     return router
 
 
-# ---------------------------------------------------------------------------
-# Admin seed + indexes
-# ---------------------------------------------------------------------------
 async def setup_auth(db: AsyncIOMotorDatabase) -> None:
-    # Индексы
     await db.users.create_index("email", unique=True)
     await db.login_attempts.create_index("identifier")
     await db.login_attempts.create_index("updated_at", expireAfterSeconds=60 * 60 * 24)
 
-    # Admin seed
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@syncplay.local").lower()
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
     existing = await db.users.find_one({"email": admin_email})
