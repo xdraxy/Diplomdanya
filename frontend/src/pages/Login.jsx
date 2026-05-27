@@ -197,6 +197,14 @@ export default function Login() {
         <p className="text-center text-xs text-zinc-600 mt-6">
           Загружайте MP3 (до 20 МБ) и слушайте вместе в реальном времени
         </p>
+
+        <p
+          className="text-center text-[11px] tracking-[0.2em] uppercase text-zinc-700 mt-3"
+          data-testid="author-credit"
+        >
+          Разработал{" "}
+          <span className="text-cyan-500/80">Даниил Осьминин</span>
+        </p>
       </div>
     </div>
   );

@@ -462,6 +462,9 @@ export default function Room() {
               >
                 <MessageSquare className="w-4 h-4 mr-1.5" />
                 Чат
+                <span className="ml-1.5 text-xs opacity-70">
+                  {chatMessages.length}
+                </span>
               </TabsTrigger>
               <TabsTrigger
                 value="participants"
